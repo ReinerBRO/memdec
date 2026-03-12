@@ -1,0 +1,166 @@
+#!/bin/bash
+#SBATCH -J memdec_train
+#SBATCH -p acd_u
+#SBATCH -n 48
+#SBATCH --gres=gpu:4
+#SBATCH -o /dev/null
+#SBATCH -e /dev/null
+#SBATCH -D /data/user/jzhu997/MemoryDecoder
+
+set -euo pipefail
+
+mkdir -p ./logs
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+SUBSET_TAG=${SUBSET_TAG:-train1of8}
+STUDENT_TAG=${STUDENT_TAG:-gpt2_small}
+LOG_FILE="./logs/train_memdec_${STUDENT_TAG}_${SUBSET_TAG}_${TIMESTAMP}_${SLURM_JOB_ID}.log"
+exec > "$LOG_FILE" 2>&1
+
+module load cuda/12.2 2>/dev/null || module load cuda/12.4 2>/dev/null || module load cuda 2>/dev/null || true
+set +u
+source /data/user/jzhu997/envs/memorydecoder/bin/activate
+set -u
+
+ENV_ROOT=/data/user/jzhu997/envs/memorydecoder
+PYTHON_BIN="${ENV_ROOT}/bin/python"
+NVIDIA_LIB_DIRS="$(${PYTHON_BIN} - <<'PY'
+from pathlib import Path
+from sysconfig import get_paths
+
+root = Path(get_paths()["purelib"]) / "nvidia"
+lib_dirs = sorted(str(path) for path in root.glob("*/lib") if path.is_dir())
+print(":".join(lib_dirs))
+PY
+)"
+
+export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1
+export TOKENIZERS_PARALLELISM=false
+if [ -n "${NVIDIA_LIB_DIRS}" ]; then
+  export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}:${ENV_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+else
+  export LD_LIBRARY_PATH="${ENV_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+fi
+export HF_HOME=/data/user/jzhu997/.cache/huggingface
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export TRANSFORMERS_CACHE=$HF_HOME/hub
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export NCCL_IB_DISABLE=1
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/output_layout.sh"
+NUM_GPUS=${NUM_GPUS:-4}
+CPU_THREADS_PER_PROC=${CPU_THREADS_PER_PROC:-12}
+export OMP_NUM_THREADS="${CPU_THREADS_PER_PROC}"
+
+HPC2_CACHE=/hpc2hdd/home/jzhu997/cache
+HPC3_CACHE=/data/user/jzhu997/cache
+DEFAULT_TRAIN_MODEL_HPC2=${HPC2_CACHE}/Models/gpt2-finetuned-wikitext103
+DEFAULT_TRAIN_MODEL_HPC3=${HPC3_CACHE}/Models/gpt2-finetuned-wikitext103
+TRAIN_MODEL_HPC2=${TRAIN_MODEL_HPC2:-${DEFAULT_TRAIN_MODEL_HPC2}}
+TRAIN_MODEL_HPC3=${TRAIN_MODEL_HPC3:-${DEFAULT_TRAIN_MODEL_HPC3}}
+PROC_DATASET=/data/user/jzhu997/MemoryDecoder/dataset/wikitext-gpt2-${SUBSET_TAG}
+KNN_SAVE_PATH=/data/user/jzhu997/MemoryDecoder/dstore/gpt2-xl-wikitext103-${SUBSET_TAG}/knn_gpt2_train_1600.arrow
+OUTPUT_DIR=${OUTPUT_DIR:-/data/user/jzhu997/MemoryDecoder/outputs/train_memdec_${STUDENT_TAG}_${SUBSET_TAG}}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
+EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-16}
+GRAD_ACCUM=${GRAD_ACCUM:-1}
+NUM_EPOCHS=${NUM_EPOCHS:-70}
+LEARNING_RATE=${LEARNING_RATE:-1e-3}
+ALPHA=${ALPHA:-0.5}
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
+DATALOADER_PREFETCH_FACTOR=${DATALOADER_PREFETCH_FACTOR:-1}
+PIN_MEMORY=${PIN_MEMORY:-0}
+ENABLE_TRACKING=${ENABLE_TRACKING:-1}
+TRACKING_BACKEND=${TRACKING_BACKEND:-tensorboard}
+TRACKING_PROJECT_NAME=${TRACKING_PROJECT_NAME:-memdec_train}
+TRACKING_DIR=${TRACKING_DIR:-$(tb_dir "train_memdec_${STUDENT_TAG}_${SUBSET_TAG}")}
+TRACKING_RUN_NAME=${TRACKING_RUN_NAME:-train_memdec_${STUDENT_TAG}_${SUBSET_TAG}_${SLURM_JOB_ID}}
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] workdir=$PWD"
+echo "[INFO] log_file=$LOG_FILE"
+echo "[INFO] subset_tag=${SUBSET_TAG}"
+echo "[INFO] student_tag=${STUDENT_TAG}"
+echo "[INFO] train_model=${TRAIN_MODEL_HPC3}"
+echo "[INFO] dataloader_num_workers=${DATALOADER_NUM_WORKERS}"
+echo "[INFO] dataloader_prefetch_factor=${DATALOADER_PREFETCH_FACTOR}"
+echo "[INFO] pin_memory=${PIN_MEMORY}"
+echo "[INFO] enable_tracking=${ENABLE_TRACKING}"
+echo "[INFO] tracking_backend=${TRACKING_BACKEND}"
+echo "[INFO] tracking_dir=${TRACKING_DIR}"
+echo "[INFO] nvidia_lib_dirs=${NVIDIA_LIB_DIRS:-none}"
+echo "[INFO] num_gpus=${NUM_GPUS}"
+echo "[INFO] cpu_threads_per_proc=${CPU_THREADS_PER_PROC}"
+nvidia-smi || true
+
+if [ ! -d "${TRAIN_MODEL_HPC3}" ] && [ -n "${TRAIN_MODEL_HPC2}" ]; then
+  echo "[INFO] pulling training model from HPC2"
+  mkdir -p "${HPC3_CACHE}/Models"
+  rsync -avh --delete "jzhu997@hpc2login.hpc.hkust-gz.edu.cn:${TRAIN_MODEL_HPC2}/" "${TRAIN_MODEL_HPC3}/"
+fi
+
+test -d "${TRAIN_MODEL_HPC3}" || { echo "[ERROR] missing training model ${TRAIN_MODEL_HPC3}"; exit 1; }
+test -d "${PROC_DATASET}" || { echo "[ERROR] missing processed dataset ${PROC_DATASET}"; exit 1; }
+test -f "${KNN_SAVE_PATH}" || { echo "[ERROR] missing kNN signal file ${KNN_SAVE_PATH}"; exit 1; }
+
+python - <<'PY'
+import faiss
+print("faiss_file", faiss.__file__)
+print("num_gpus", faiss.get_num_gpus())
+PY
+
+mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${TRACKING_DIR}"
+
+PIN_MEMORY_ARGS=()
+if [ "${PIN_MEMORY}" != "1" ]; then
+  PIN_MEMORY_ARGS+=(--no_pin_memory)
+fi
+
+TRACKING_ARGS=()
+if [ "${ENABLE_TRACKING}" = "1" ]; then
+  TRACKING_ARGS=(
+    --with_tracking
+    --report_to "${TRACKING_BACKEND}"
+    --project_name "${TRACKING_PROJECT_NAME}"
+    --run_name "${TRACKING_RUN_NAME}"
+    --tracking_dir "${TRACKING_DIR}"
+  )
+fi
+
+RESUME_ARGS=()
+if [ -n "${RESUME_FROM_CHECKPOINT:-}" ]; then
+  RESUME_ARGS=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+else
+  LATEST_CHECKPOINT=$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'epoch_*' | sort -V | tail -n 1 || true)
+  if [ -n "${LATEST_CHECKPOINT}" ]; then
+    echo "[INFO] resuming from ${LATEST_CHECKPOINT}"
+    RESUME_ARGS=(--resume_from_checkpoint "${LATEST_CHECKPOINT}")
+  fi
+fi
+
+accelerate launch --multi_gpu --num_machines 1 --num_processes "${NUM_GPUS}" --mixed_precision bf16 \
+  -m train_memdec \
+  --model_name_or_path "${TRAIN_MODEL_HPC3}" \
+  --dataset_name "${PROC_DATASET}" \
+  --dataset_split_name train \
+  --knn_save_path "${KNN_SAVE_PATH}" \
+  --output_dir "${OUTPUT_DIR}" \
+  --learning_rate "${LEARNING_RATE}" \
+  --lr_scheduler_type linear \
+  --gradient_accumulation_steps "${GRAD_ACCUM}" \
+  --per_device_train_batch_size "${TRAIN_BATCH_SIZE}" \
+  --per_device_eval_batch_size "${EVAL_BATCH_SIZE}" \
+  --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
+  --dataloader_prefetch_factor "${DATALOADER_PREFETCH_FACTOR}" \
+  --num_train_epochs "${NUM_EPOCHS}" \
+  --seed 42 \
+  --alpha "${ALPHA}" \
+  --checkpointing_steps epoch \
+  --logging_steps 20 \
+  "${TRACKING_ARGS[@]}" \
+  "${PIN_MEMORY_ARGS[@]}" \
+  "${RESUME_ARGS[@]}"
+
+echo "[INFO] Memory Decoder training finished"

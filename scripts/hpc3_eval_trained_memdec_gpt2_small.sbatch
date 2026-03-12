@@ -1,0 +1,129 @@
+#!/bin/bash
+#SBATCH -J memdec_eval
+#SBATCH -p acd_u
+#SBATCH -n 32
+#SBATCH --gres=gpu:4
+#SBATCH -o /dev/null
+#SBATCH -e /dev/null
+#SBATCH -D /data/user/jzhu997/MemoryDecoder
+
+set -euo pipefail
+
+mkdir -p ./logs
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="./logs/eval_trained_memdec_gpt2_small_${TIMESTAMP}_${SLURM_JOB_ID}.log"
+exec > "$LOG_FILE" 2>&1
+
+module load cuda/12.2 2>/dev/null || module load cuda/12.4 2>/dev/null || module load cuda 2>/dev/null || true
+set +u
+source /data/user/jzhu997/envs/memorydecoder/bin/activate
+set -u
+
+ENV_ROOT=/data/user/jzhu997/envs/memorydecoder
+PYTHON_BIN="${ENV_ROOT}/bin/python"
+NVIDIA_LIB_DIRS="$(${PYTHON_BIN} - <<'PY'
+from pathlib import Path
+from sysconfig import get_paths
+
+root = Path(get_paths()["purelib"]) / "nvidia"
+lib_dirs = sorted(str(path) for path in root.glob("*/lib") if path.is_dir())
+print(":".join(lib_dirs))
+PY
+)"
+
+export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1
+export TOKENIZERS_PARALLELISM=false
+if [ -n "${NVIDIA_LIB_DIRS}" ]; then
+  export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}:${ENV_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+else
+  export LD_LIBRARY_PATH="${ENV_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+fi
+export HF_HOME=/data/user/jzhu997/.cache/huggingface
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export TRANSFORMERS_CACHE=$HF_HOME/hub
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export NCCL_IB_DISABLE=1
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/output_layout.sh"
+NUM_GPUS=${NUM_GPUS:-4}
+CPU_THREADS_PER_PROC=${CPU_THREADS_PER_PROC:-8}
+export OMP_NUM_THREADS="${CPU_THREADS_PER_PROC}"
+
+BASE_MODEL=/data/user/jzhu997/cache/Models/gpt2
+PROC_DATASET=/data/user/jzhu997/MemoryDecoder/dataset/wikitext-gpt2
+TRAIN_OUTPUT_DIR=/data/user/jzhu997/MemoryDecoder/outputs/train_memdec_gpt2_small
+BASE_EVAL_OUTPUT_DIR=${BASE_EVAL_OUTPUT_DIR:-$(result_dir "base_gpt2_small")}
+JOINT_EVAL_OUTPUT_DIR=${JOINT_EVAL_OUTPUT_DIR:-$(result_dir "eval_trained_memdec_gpt2_small")}
+LMBDA=${LMBDA:-0.80}
+KNN_TEMP=${KNN_TEMP:-1.0}
+ENABLE_TRACKING=${ENABLE_TRACKING:-1}
+TRACKING_BACKEND=${TRACKING_BACKEND:-tensorboard}
+BASE_TRACKING_DIR=${BASE_TRACKING_DIR:-$(tb_dir "base_gpt2_small")}
+JOINT_TRACKING_DIR=${JOINT_TRACKING_DIR:-$(tb_dir "eval_trained_memdec_gpt2_small")}
+BASE_RUN_NAME=${BASE_RUN_NAME:-base_gpt2_small_${SLURM_JOB_ID}}
+JOINT_RUN_NAME=${JOINT_RUN_NAME:-eval_trained_memdec_gpt2_small_${SLURM_JOB_ID}}
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] workdir=$PWD"
+echo "[INFO] log_file=$LOG_FILE"
+echo "[INFO] enable_tracking=${ENABLE_TRACKING}"
+echo "[INFO] tracking_backend=${TRACKING_BACKEND}"
+echo "[INFO] base_tracking_dir=${BASE_TRACKING_DIR}"
+echo "[INFO] joint_tracking_dir=${JOINT_TRACKING_DIR}"
+echo "[INFO] nvidia_lib_dirs=${NVIDIA_LIB_DIRS:-none}"
+echo "[INFO] num_gpus=${NUM_GPUS}"
+echo "[INFO] cpu_threads_per_proc=${CPU_THREADS_PER_PROC}"
+nvidia-smi || true
+
+MEMDEC_MODEL=${MEMDEC_MODEL:-$(find "${TRAIN_OUTPUT_DIR}" -maxdepth 1 -type d -name 'epoch_*' | sort -V | tail -n 1 || true)}
+
+test -d "${BASE_MODEL}" || { echo "[ERROR] missing base model ${BASE_MODEL}"; exit 1; }
+test -d "${PROC_DATASET}" || { echo "[ERROR] missing processed dataset ${PROC_DATASET}"; exit 1; }
+test -n "${MEMDEC_MODEL}" || { echo "[ERROR] no trained checkpoint found under ${TRAIN_OUTPUT_DIR}"; exit 1; }
+test -d "${MEMDEC_MODEL}" || { echo "[ERROR] missing trained checkpoint ${MEMDEC_MODEL}"; exit 1; }
+
+mkdir -p "${BASE_EVAL_OUTPUT_DIR}" "${JOINT_EVAL_OUTPUT_DIR}" "${BASE_TRACKING_DIR}" "${JOINT_TRACKING_DIR}"
+
+BASE_TRACKING_ARGS=()
+JOINT_TRACKING_ARGS=()
+if [ "${ENABLE_TRACKING}" = "1" ]; then
+  BASE_TRACKING_ARGS=(
+    --report_to "${TRACKING_BACKEND}"
+    --logging_dir "${BASE_TRACKING_DIR}"
+    --run_name "${BASE_RUN_NAME}"
+  )
+  JOINT_TRACKING_ARGS=(
+    --with_tracking
+    --report_to "${TRACKING_BACKEND}"
+    --project_name memdec_eval
+    --run_name "${JOINT_RUN_NAME}"
+    --tracking_dir "${JOINT_TRACKING_DIR}"
+  )
+fi
+
+accelerate launch --multi_gpu --num_machines 1 --num_processes "${NUM_GPUS}" --mixed_precision bf16 \
+  -m train_base \
+  --model_name_or_path "${BASE_MODEL}" \
+  --dataset_name "${PROC_DATASET}" \
+  --per_device_eval_batch_size 16 \
+  --do_eval \
+  --eval_subset test \
+  --output_dir "${BASE_EVAL_OUTPUT_DIR}" \
+  "${BASE_TRACKING_ARGS[@]}"
+
+accelerate launch --multi_gpu --num_machines 1 --num_processes "${NUM_GPUS}" --mixed_precision bf16 \
+  -m evaluate_joint \
+  --do_test \
+  --model_name_or_path "${BASE_MODEL}" \
+  --dataset_name "${PROC_DATASET}" \
+  --dataset_split_name test \
+  --per_device_eval_batch_size 16 \
+  --output_dir "${JOINT_EVAL_OUTPUT_DIR}" \
+  --knn_temp "${KNN_TEMP}" \
+  --lmbda "${LMBDA}" \
+  --knn_generator_path "${MEMDEC_MODEL}" \
+  "${JOINT_TRACKING_ARGS[@]}"
+
+echo "[INFO] trained Memory Decoder evaluation finished"

@@ -1,0 +1,293 @@
+下面给你一个可执行的复现计划，目标是复现论文主实验里最小模型的一项结果：
+
+Table 1 / WikiText-103 上，GPT2-small + Memory Decoder 的测试集困惑度（PPL）= 13.36。论文表 1 给出了这一结果，README 也单独列出了同样的数字。
+
+复现目标
+
+复现论文主实验中最小模型这一项：
+
+Base model：GPT2-small
+
+Memory model：124M 参数的 Memory Decoder
+
+Dataset：WikiText-103
+
+Metric：test perplexity
+
+目标数值：Base 24.89，+MemDec 13.36。
+
+之所以选这一项，是因为它是论文主实验里最小的模型设置，而且作者仓库直接提供了 gpt2-small Memory Decoder checkpoint 和对应的 WikiText-103 评测说明，复现门槛最低。
+
+你需要的模型和数据
+模型
+
+基础语言模型：gpt2 / GPT2-small
+这是论文 Table 1 中最小的 base model。
+
+Memory Decoder 模型：作者提供的 gpt2-small Memory Decoder checkpoint
+README 明确写了：他们提供了“gpt2-small Memory Decoder used in our experiments”的 checkpoint。
+
+数据集
+
+WikiText-103
+
+论文主语言建模实验使用的是 WikiText-103。
+
+README 的最小复现示例也是直接用 wikitext-103-raw-v1。
+
+两种复现口径
+
+你可以走两条线，我建议先做 A，再做 B。
+
+A. 最小可复现：只复现论文结果数字
+
+目标：尽快验证 GPT2-small + 预训练好的 MemDec 在 WikiText-103 test 上接近 13.36 PPL。
+这条线不需要从头训练 Memory Decoder，直接用作者给的 checkpoint。README 已经给了评测命令模板。
+
+B. 完整复现：从头训练一个 GPT2-small Memory Decoder 再评测
+
+目标：从原始数据出发，复现完整 pipeline，包括：
+
+预处理数据
+
+构建 embedding
+
+建 FAISS index
+
+生成 kNN 分布监督信号
+
+训练 Memory Decoder
+
+最后 joint evaluation
+
+仓库 README 把这些步骤和脚本都列出来了。
+
+复现计划
+第一阶段：环境搭建
+
+按 README 的推荐版本：
+
+CUDA 12.4
+
+PyTorch 2.6.0
+
+transformers 4.55.4
+
+datasets 4.0.0
+
+faiss-gpu 1.12.0（作者特别提醒不要用有排序 bug 的版本）
+
+建议直接新建一个独立环境，避免和你现有训练环境冲突。
+
+安装
+
+按 README 推荐：
+
+faiss-gpu=1.12.0
+
+torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+
+transformers==4.55.4 datasets==4.0.0 accelerate pyarrow evaluate loguru wandb tqdm
+
+阶段产出
+
+确认下面三个对象都能正常下载并加载：
+
+GPT2-small
+
+gpt2-small Memory Decoder checkpoint
+
+WikiText-103
+
+第二阶段：最小评测复现（优先做）
+
+这一阶段的目标是：
+不用训练，先跑出论文里“+MemDec 明显优于 base”的结果。
+
+Step 1：下载模型和数据
+
+你需要：
+
+gpt2
+
+作者提供的 gpt2-small Memory Decoder
+
+wikitext-103-raw-v1
+
+README 已明确给出这三者。
+
+Step 2：预处理 WikiText-103
+
+按 README 的 preprocess_dataset.sh 模板执行：
+
+tokenizer 用 GPT2-small 对应 tokenizer
+
+dataset config 用 wikitext-103-raw-v1
+
+输出到本地预处理目录
+
+Step 3：先测 base PPL
+
+按 README 的 evaluate_base_gpt.sh 跑：
+
+model = GPT2-small
+
+eval split = test
+
+你应该先验证 base 结果接近 24.89。论文表 1 和 README 的结果表都给了这个基线。
+
+Step 4：测 joint model（base + MemDec）
+
+按 README 的 evaluate_joint_gpt2.sh 跑：
+
+关键参数：
+
+--model_name_or_path = GPT2-small
+
+--knn_generator_path = gpt2-small Memory Decoder checkpoint
+
+--dataset_split_name test
+
+--lmbda 0.55
+
+--knn_temp 1
+
+预期结果
+
+目标是 test PPL 接近 13.36。
+如果你的数值在 13.2–13.6 左右，我会认为复现基本成功。因为不同机器、tokenizer 路径和评测批大小可能带来轻微波动。
+
+阶段成功判定
+
+满足这两个条件就算成功：
+
+base PPL 接近 24.89
+
++MemDec PPL 接近 13.36
+
+第三阶段：完整训练复现（从头训练）
+
+如果第二阶段跑通，再做这一阶段。
+
+目标
+
+从 WikiText-103 训练出一个自己的 GPT2-small Memory Decoder，然后评测它是否接近论文结果。
+
+仓库里涉及的关键脚本
+
+README 列出的训练相关目录如下：
+
+knn_utils/build_index.py
+
+knn_utils/saveEmbedMulti.py
+
+knn_utils/saveKNNMulti.py
+
+scripts/save_pipeline.sh
+
+train_memdec.py
+
+Step 1：预处理语料
+
+还是先跑 WikiText-103 预处理。
+
+Step 2：生成 base model embeddings
+
+用 GPT2-small 在训练语料上提取隐藏表示。
+这是为了后续构建 kNN datastore。论文第 3.1 节明确说，Memory Decoder 的监督信号来自先构建 key-value datastore，再对每个 context 做 kNN 搜索并缓存 context-distribution pairs。
+
+Step 3：建立 FAISS index
+
+用生成好的 embeddings 建索引。README 的 build_index.py 就是为这个准备的。
+
+Step 4：生成 kNN 分布监督信号
+
+对训练集样本做最近邻搜索，缓存每个 context 对应的 non-parametric distribution。
+这是论文训练的核心监督。论文第 3.1 节明确说明训练对是 (context, knn distribution)。
+
+Step 5：训练 Memory Decoder
+
+运行 train_memdec.py。
+论文说明它的训练目标是：
+
+KL 分布对齐损失
+
+叠加标准 language modeling loss 的混合目标
+
+Step 6：joint evaluation
+
+训练完成后，用 evaluate_joint.py 在 test 集上评估：
+
+base + 你自己训出的 MemDec
+
+成功标准
+
+理想目标：接近论文 13.36 PPL
+
+实际工程目标：如果能稳定进入 13.x–14.x，就已经说明 pipeline 大体复现成功
+
+推荐的执行顺序
+第 1 天
+
+先做最小复现：
+
+环境装好
+
+跑 WikiText-103 预处理
+
+测 base GPT2-small
+
+用作者提供的 gpt2-small MemDec checkpoint 做 joint eval
+
+这一天的目标不是训练，而是验证：
+
+环境无误
+
+数据格式无误
+
+评测脚本无误
+
+数值方向一致
+
+第 2 天开始
+
+再做完整训练复现：
+
+保存 embeddings
+
+建 FAISS index
+
+生成 kNN 分布
+
+训练 Memory Decoder
+
+joint eval
+
+你最容易踩的坑
+1. FAISS 版本
+
+作者明确提醒：
+
+某些 faiss-gpu 版本邻居返回顺序有 bug
+
+推荐 faiss-gpu 1.12.0
+
+2. datasets 版本
+
+README 明确建议：
+
+datasets==4.0.0
+高版本的 Column object 会影响实现。
+
+3. tokenizer 必须对齐
+
+Memory Decoder 的一个关键前提是：
+
+它能 plug-and-play 到共享同一 tokenizer 的模型上。论文和 README 都反复强调这一点。
+
+所以你复现这项 GPT2-small 结果时，基模和 MemDec 必须使用 GPT2 tokenizer 体系。
+
+4. 不要一开始就换数据集或换 backbone
+
+如果你第一步就改成 Qwen 或换 biomedical/finance/law 语料，变量太多。
+先把 WikiText-103 + GPT2-small 这条最小主实验跑通。
