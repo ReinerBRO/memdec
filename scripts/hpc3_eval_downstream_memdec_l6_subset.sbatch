@@ -31,7 +31,11 @@ export TRANSFORMERS_OFFLINE=1
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/output_layout.sh"
 
 BASE_MODEL=${BASE_MODEL:-/data/user/jzhu997/cache/Models/gpt2}
-MEMDEC_MODEL=${MEMDEC_MODEL:-/data/user/jzhu997/MemoryDecoder/outputs/train_memdec_gpt2_small_l6_train1of8/epoch_14}
+SUBSET_TAG=${SUBSET_TAG:-train1of8}
+STUDENT_TAG=${STUDENT_TAG:-gpt2_small_l6}
+TRAIN_RUN_NAME=${TRAIN_RUN_NAME:-train_memdec_${STUDENT_TAG}_${SUBSET_TAG}}
+TRAIN_OUTPUT_DIR=${TRAIN_OUTPUT_DIR:-$(latest_run_dir "${TRAIN_RUN_NAME}")}
+MEMDEC_MODEL=${MEMDEC_MODEL:-$(latest_epoch_checkpoint "${TRAIN_OUTPUT_DIR}")}
 TASK_ROOT=${TASK_ROOT:-/data/user/jzhu997/cache/data/memorydecoder_knn_prompt_task_data}
 YAHOO_DATASET_PATH=${YAHOO_DATASET_PATH:-${TASK_ROOT}/yahoo/yahoo_answers_topics}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$(result_dir "downstream_memdec_base_gpt2_with_memdec_gpt2_small_l6_train1of8")}
@@ -41,6 +45,8 @@ DTYPE=${DTYPE:-bfloat16}
 echo "[INFO] host=$(hostname)"
 echo "[INFO] log_file=$LOG_FILE"
 echo "[INFO] base_model=${BASE_MODEL}"
+echo "[INFO] train_run_name=${TRAIN_RUN_NAME}"
+echo "[INFO] train_output_dir=${TRAIN_OUTPUT_DIR}"
 echo "[INFO] memdec_model=${MEMDEC_MODEL}"
 echo "[INFO] task_root=${TASK_ROOT}"
 echo "[INFO] yahoo_dataset_path=${YAHOO_DATASET_PATH}"

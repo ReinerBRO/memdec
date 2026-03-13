@@ -1,10 +1,17 @@
 /tmp
 /checkpoint
+/ckpt
 /dataset
 /results
 /dstore
 /outputs
 /models
+/logs
+/tb_logs
+/tb_logs_view
+/wandb_logs
+/kernel_meta
+/fusion_result.json
 
 # macOS metadata
 .DS_Store

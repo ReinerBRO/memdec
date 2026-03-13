@@ -49,6 +49,7 @@ from accelerate.utils import set_seed
 from datasets import load_dataset,load_from_disk
 from huggingface_hub import HfApi
 from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
 
 import transformers
@@ -436,53 +437,46 @@ def main():
     if accelerator.is_main_process:
         logger.info(f"Loading knn dstore and val dstore from {args.knn_save_path}...")
     knn_dstore = Dataset.from_file(args.knn_save_path)
-    knn_dstore.set_format(type='torch', columns=['id_cnt', 'token_id', 'prob', 'label'])
     
     def knn_collate_fn(batch, knn_dstore, vocab_size):
         """
-        Custom collate function that handles kNN data processing directly
+        Build sparse top-k KNN tensors once per batch instead of materializing
+        a dense vocab-sized distribution for every token on the CPU side.
         
         Args:
             batch: The batch of data
             knn_dstore: The KNN datastore
             vocab_size: Size of the vocabulary
-            device: The device to move tensors to (accelerator.device)
         """
-        # Apply default collation to the batch
         collated_batch = default_data_collator(batch)
-        
-        # Process kNN data for all items in the batch
         knn_labels_list = []
+        knn_token_ids_list = []
         knn_probs_list = []
-        
-        # Process each dstore_range in the batch
-        for idx, cur_range in enumerate(collated_batch["dstore_range"]):
-            # Get range boundaries
-            start, end = int(cur_range[0]), int(cur_range[1])
-            
-            # Slice the knn_dstore
-            knn_dstore_slice = knn_dstore.select(range(start, end))
-            
-            # Extract kNN label
-            # Note that since datasets version 4.0.0, we can't use direct column selecting since the implementation of lazy columns, see pr https://github.com/huggingface/datasets/pull/7614
-            cur_knn_label = knn_dstore_slice[:]["label"]
-            knn_labels_list.append(cur_knn_label)
-            
-            # Extract token IDs and probabilities
-            cur_token_id = knn_dstore_slice[:]["token_id"]
-            cur_prob = knn_dstore_slice[:]["prob"]
-            
-            # Create sparse probability tensor
-            cur_knn_prob = torch.zeros(size=(end - start, vocab_size))
-            for i in range(end - start):
-                assert cur_token_id[i].max() < vocab_size, f"token_id {cur_token_id[i]} is out of vocab size {vocab_size}"
-                cur_knn_prob[i][cur_token_id[i]] = cur_prob[i]
-            
-            knn_probs_list.append(cur_knn_prob)
-        
-        # Concatenate and move to device
+
+        for start, end in collated_batch["dstore_range"].tolist():
+            knn_dstore_slice = knn_dstore[start:end]
+            knn_labels_list.append(torch.as_tensor(knn_dstore_slice["label"], dtype=torch.long))
+            knn_token_ids_list.extend(
+                torch.as_tensor(token_ids, dtype=torch.long)
+                for token_ids in knn_dstore_slice["token_id"]
+            )
+            knn_probs_list.extend(
+                torch.as_tensor(probs, dtype=torch.float32)
+                for probs in knn_dstore_slice["prob"]
+            )
+
         collated_batch["knn_label"] = torch.cat(knn_labels_list, dim=0)
-        collated_batch["knn_probs"] = torch.cat(knn_probs_list, dim=0)
+        collated_batch["knn_token_ids"] = pad_sequence(knn_token_ids_list, batch_first=True, padding_value=0)
+        collated_batch["knn_probs"] = pad_sequence(knn_probs_list, batch_first=True, padding_value=0.0)
+        collated_batch["knn_token_mask"] = pad_sequence(
+            [torch.ones_like(probs, dtype=torch.bool) for probs in knn_probs_list],
+            batch_first=True,
+            padding_value=False,
+        )
+
+        if collated_batch["knn_token_ids"].numel() > 0:
+            max_token_id = collated_batch["knn_token_ids"][collated_batch["knn_token_mask"]].max()
+            assert int(max_token_id) < vocab_size, f"token_id {int(max_token_id)} is out of vocab size {vocab_size}"
         
         return collated_batch
     

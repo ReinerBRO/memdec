@@ -57,18 +57,22 @@ TRAIN_MODEL_HPC2=${HPC2_CACHE}/Models/gpt2-finetuned-wikitext103
 TRAIN_MODEL_HPC3=${HPC3_CACHE}/Models/gpt2-finetuned-wikitext103
 PROC_DATASET=/data/user/jzhu997/MemoryDecoder/dataset/wikitext-gpt2
 KNN_SAVE_PATH=/data/user/jzhu997/MemoryDecoder/dstore/gpt2-xl-wikitext103-train/knn_gpt2_train_1600.arrow
-OUTPUT_DIR=${OUTPUT_DIR:-/data/user/jzhu997/MemoryDecoder/outputs/train_memdec_gpt2_small}
+RUN_NAME=${RUN_NAME:-train_memdec_gpt2_small}
+OUTPUT_DIR=${OUTPUT_DIR:-$(ckpt_dir "${RUN_NAME}")}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-16}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 NUM_EPOCHS=${NUM_EPOCHS:-70}
+MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
 LEARNING_RATE=${LEARNING_RATE:-1e-3}
 ALPHA=${ALPHA:-0.5}
 ENABLE_TRACKING=${ENABLE_TRACKING:-1}
 TRACKING_BACKEND=${TRACKING_BACKEND:-tensorboard}
 TRACKING_PROJECT_NAME=${TRACKING_PROJECT_NAME:-memdec_train}
 TRACKING_DIR=${TRACKING_DIR:-$(tb_dir "train_memdec_gpt2_small")}
-TRACKING_RUN_NAME=${TRACKING_RUN_NAME:-train_memdec_gpt2_small_${SLURM_JOB_ID}}
+TRACKING_RUN_NAME=${TRACKING_RUN_NAME:-${RUN_NAME}_${SLURM_JOB_ID}}
+AUTO_RESUME=${AUTO_RESUME:-0}
+LATEST_CKPT_LINK=$(ckpt_latest_link "${RUN_NAME}")
 
 echo "[INFO] host=$(hostname)"
 echo "[INFO] workdir=$PWD"
@@ -76,6 +80,8 @@ echo "[INFO] log_file=$LOG_FILE"
 echo "[INFO] enable_tracking=${ENABLE_TRACKING}"
 echo "[INFO] tracking_backend=${TRACKING_BACKEND}"
 echo "[INFO] tracking_dir=${TRACKING_DIR}"
+echo "[INFO] run_name=${RUN_NAME}"
+echo "[INFO] output_dir=${OUTPUT_DIR}"
 echo "[INFO] nvidia_lib_dirs=${NVIDIA_LIB_DIRS:-none}"
 echo "[INFO] num_gpus=${NUM_GPUS}"
 echo "[INFO] cpu_threads_per_proc=${CPU_THREADS_PER_PROC}"
@@ -91,12 +97,6 @@ test -d "${TRAIN_MODEL_HPC3}" || { echo "[ERROR] missing training model ${TRAIN_
 test -d "${PROC_DATASET}" || { echo "[ERROR] missing processed dataset ${PROC_DATASET}"; exit 1; }
 test -f "${KNN_SAVE_PATH}" || { echo "[ERROR] missing kNN signal file ${KNN_SAVE_PATH}"; exit 1; }
 
-python - <<'PY'
-import faiss
-print("faiss_file", faiss.__file__)
-print("num_gpus", faiss.get_num_gpus())
-PY
-
 mkdir -p "${OUTPUT_DIR}" "${TRACKING_DIR}"
 
 TRACKING_ARGS=()
@@ -110,11 +110,17 @@ if [ "${ENABLE_TRACKING}" = "1" ]; then
   )
 fi
 
+TRAIN_LIMIT_ARGS=()
+if [ -n "${MAX_TRAIN_STEPS}" ]; then
+  TRAIN_LIMIT_ARGS=(--max_train_steps "${MAX_TRAIN_STEPS}")
+fi
+
 RESUME_ARGS=()
 if [ -n "${RESUME_FROM_CHECKPOINT:-}" ]; then
   RESUME_ARGS=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
-else
-  LATEST_CHECKPOINT=$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'epoch_*' | sort -V | tail -n 1 || true)
+elif [ "${AUTO_RESUME}" = "1" ]; then
+  RESUME_RUN_ROOT=$(latest_run_dir "${RUN_NAME}")
+  LATEST_CHECKPOINT=$(latest_epoch_checkpoint "${RESUME_RUN_ROOT}")
   if [ -n "${LATEST_CHECKPOINT}" ]; then
     echo "[INFO] resuming from ${LATEST_CHECKPOINT}"
     RESUME_ARGS=(--resume_from_checkpoint "${LATEST_CHECKPOINT}")
@@ -134,6 +140,7 @@ accelerate launch --multi_gpu --num_machines 1 --num_processes "${NUM_GPUS}" --m
   --per_device_train_batch_size "${TRAIN_BATCH_SIZE}" \
   --per_device_eval_batch_size "${EVAL_BATCH_SIZE}" \
   --num_train_epochs "${NUM_EPOCHS}" \
+  "${TRAIN_LIMIT_ARGS[@]}" \
   --seed 42 \
   --alpha "${ALPHA}" \
   --checkpointing_steps epoch \
@@ -141,4 +148,5 @@ accelerate launch --multi_gpu --num_machines 1 --num_processes "${NUM_GPUS}" --m
   "${TRACKING_ARGS[@]}" \
   "${RESUME_ARGS[@]}"
 
+update_latest_link "${OUTPUT_DIR}" "${LATEST_CKPT_LINK}"
 echo "[INFO] Memory Decoder training finished"

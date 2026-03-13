@@ -53,7 +53,8 @@ export OMP_NUM_THREADS="${CPU_THREADS_PER_PROC}"
 
 BASE_MODEL=/data/user/jzhu997/cache/Models/gpt2
 PROC_DATASET=/data/user/jzhu997/MemoryDecoder/dataset/wikitext-gpt2
-TRAIN_OUTPUT_DIR=/data/user/jzhu997/MemoryDecoder/outputs/train_memdec_gpt2_small
+TRAIN_RUN_NAME=${TRAIN_RUN_NAME:-train_memdec_gpt2_small}
+TRAIN_OUTPUT_DIR=${TRAIN_OUTPUT_DIR:-$(latest_run_dir "${TRAIN_RUN_NAME}")}
 BASE_EVAL_OUTPUT_DIR=${BASE_EVAL_OUTPUT_DIR:-$(result_dir "base_gpt2_small")}
 JOINT_EVAL_OUTPUT_DIR=${JOINT_EVAL_OUTPUT_DIR:-$(result_dir "eval_trained_memdec_gpt2_small")}
 LMBDA=${LMBDA:-0.80}
@@ -72,15 +73,18 @@ echo "[INFO] enable_tracking=${ENABLE_TRACKING}"
 echo "[INFO] tracking_backend=${TRACKING_BACKEND}"
 echo "[INFO] base_tracking_dir=${BASE_TRACKING_DIR}"
 echo "[INFO] joint_tracking_dir=${JOINT_TRACKING_DIR}"
+echo "[INFO] train_run_name=${TRAIN_RUN_NAME}"
+echo "[INFO] train_output_dir=${TRAIN_OUTPUT_DIR}"
 echo "[INFO] nvidia_lib_dirs=${NVIDIA_LIB_DIRS:-none}"
 echo "[INFO] num_gpus=${NUM_GPUS}"
 echo "[INFO] cpu_threads_per_proc=${CPU_THREADS_PER_PROC}"
 nvidia-smi || true
 
-MEMDEC_MODEL=${MEMDEC_MODEL:-$(find "${TRAIN_OUTPUT_DIR}" -maxdepth 1 -type d -name 'epoch_*' | sort -V | tail -n 1 || true)}
+MEMDEC_MODEL=${MEMDEC_MODEL:-$(latest_epoch_checkpoint "${TRAIN_OUTPUT_DIR}")}
 
 test -d "${BASE_MODEL}" || { echo "[ERROR] missing base model ${BASE_MODEL}"; exit 1; }
 test -d "${PROC_DATASET}" || { echo "[ERROR] missing processed dataset ${PROC_DATASET}"; exit 1; }
+test -n "${TRAIN_OUTPUT_DIR}" || { echo "[ERROR] no training run found for ${TRAIN_RUN_NAME}"; exit 1; }
 test -n "${MEMDEC_MODEL}" || { echo "[ERROR] no trained checkpoint found under ${TRAIN_OUTPUT_DIR}"; exit 1; }
 test -d "${MEMDEC_MODEL}" || { echo "[ERROR] missing trained checkpoint ${MEMDEC_MODEL}"; exit 1; }
 

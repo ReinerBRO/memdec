@@ -15,6 +15,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils.downstream_task_data import TASK_ALPHAS, load_task_examples
 
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -28,6 +33,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
+    parser.add_argument("--shard_index", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
     return parser.parse_args()
 
 
@@ -37,6 +44,14 @@ def resolve_dtype(name):
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[name]
+
+
+def resolve_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.device("npu")
+    return torch.device("cpu")
 
 
 def build_label_token_ids(tokenizer, mapping):
@@ -89,6 +104,11 @@ def score_from_dcpmi(probs, domain_probs, label_token_ids):
 
 def main():
     args = parse_args()
+    if args.num_shards < 1:
+        raise ValueError("--num_shards must be >= 1")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,15 +118,22 @@ def main():
     tokenizer.truncation_side = "left"
 
     dtype = resolve_dtype(args.dtype)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
+    if device.type == "npu":
+        torch.npu.set_device(device)
     base_model = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype=dtype).to(device).eval()
     memdec_model = AutoModelForCausalLM.from_pretrained(args.memdec_model, torch_dtype=dtype).to(device).eval()
 
-    examples = load_task_examples(
+    all_examples = load_task_examples(
         task_name=args.task,
         task_root=args.task_root,
         yahoo_dataset_path=args.yahoo_dataset_path,
     )
+    if not all_examples:
+        raise ValueError(f"No examples loaded for task {args.task}")
+
+    domain_example = all_examples[0]
+    examples = all_examples[args.shard_index :: args.num_shards]
     if args.max_examples is not None:
         examples = examples[: args.max_examples]
     if not examples:
@@ -115,7 +142,7 @@ def main():
     alpha = args.alpha if args.alpha is not None else TASK_ALPHAS[args.task]
     label2synonym_ids = build_label_token_ids(tokenizer, examples[0]["label2synonym"])
 
-    domain_text = examples[0]["options"][0]["uncond_premise"]
+    domain_text = domain_example["options"][0]["uncond_premise"]
     domain_base_probs = encode_last_token_probs(base_model, tokenizer, [domain_text], device)[0]
     domain_mem_probs = encode_last_token_probs(memdec_model, tokenizer, [domain_text], device)[0]
     domain_joint_probs = alpha * domain_mem_probs + (1.0 - alpha) * domain_base_probs
@@ -139,20 +166,31 @@ def main():
         memdec_preds.extend(memdec_scores.argmax(dim=1).tolist())
 
     total = len(labels)
-    base_acc = 100.0 * sum(int(pred == label) for pred, label in zip(base_preds, labels)) / total
-    memdec_acc = 100.0 * sum(int(pred == label) for pred, label in zip(memdec_preds, labels)) / total
+    base_correct = sum(int(pred == label) for pred, label in zip(base_preds, labels))
+    memdec_correct = sum(int(pred == label) for pred, label in zip(memdec_preds, labels))
+    base_acc = 100.0 * base_correct / total
+    memdec_acc = 100.0 * memdec_correct / total
 
     result = {
         "task": args.task,
         "alpha": alpha,
         "num_examples": total,
+        "base_correct": base_correct,
+        "memdec_correct": memdec_correct,
         "base_dcpmi_acc": round(base_acc, 4),
         "memdec_dcpmi_acc": round(memdec_acc, 4),
         "base_model": args.base_model,
         "memdec_model": args.memdec_model,
+        "device": str(device),
+        "shard_index": args.shard_index,
+        "num_shards": args.num_shards,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    (output_dir / f"{args.task}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    if args.num_shards == 1:
+        output_path = output_dir / f"{args.task}.json"
+    else:
+        output_path = output_dir / f"{args.task}.shard{args.shard_index}of{args.num_shards}.json"
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 
 
 if __name__ == "__main__":
